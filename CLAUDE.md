@@ -1,4 +1,4 @@
-# Stock Screener - 温度计选股工具
+# jojo_quant (韭韭量化) - 温度计选股工具
 
 基于温度计 (Thermometer) 复合动量指标的全市场扫描工具。扫描范围覆盖 NASDAQ + NYSE 全部股票、主要加密货币和商品期货。
 

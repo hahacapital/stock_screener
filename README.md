@@ -1,4 +1,4 @@
-# 温度计 (Thermometer) Stock Screener
+# jojo_quant (韭韭量化) - 温度计选股工具
 
 每日扫描 NASDAQ + NYSE 全部股票、主要加密货币和商品期货，基于温度计指标的两种策略选股：
 

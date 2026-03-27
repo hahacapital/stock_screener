@@ -1,5 +1,5 @@
 """
-Stock Screener — scan stocks, crypto, and commodities for 温度计 signals.
+jojo_quant (韭韭量化) — scan stocks, crypto, and commodities for 温度计 signals.
 
 Strategy 1 (超买动量): thermometer crosses UP through 76 today (ATR% >= 2.0)
 Strategy 2 (超卖反转): thermometer was below 28 and turns upward today
@@ -574,7 +574,7 @@ def scan_signals(all_data: dict[str, pd.DataFrame], strategy: str = "all") -> tu
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="温度计 stock screener")
+    parser = argparse.ArgumentParser(description="韭韭量化 温度计选股")
     parser.add_argument("--strategy", type=str, default="all", choices=["1", "2", "all"],
                         help="Which strategy to scan: 1, 2, or all (default: all)")
     parser.add_argument("--top", type=int, default=0,
@@ -586,7 +586,7 @@ def main():
     args = parser.parse_args()
 
     strat_desc = {"1": "Strategy 1 only", "2": "Strategy 2 only", "all": "All strategies"}
-    print("=== 温度计 Stock Screener ===")
+    print("=== 韭韭量化 温度计选股 ===")
     print(f"Mode: {strat_desc[args.strategy]}")
     print()
 

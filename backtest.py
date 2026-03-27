@@ -396,7 +396,7 @@ def run_backtest(symbol: str, df: pd.DataFrame, therm_vals: np.ndarray = None,
     # Optimized strategies
     atr_pct = _compute_atr_pct(df, closes, start)
     regime_filter = _build_regime_filter(dates, regime)
-    sma_filter = _build_sma_filter(closes, 50)
+    sma_filter = _build_sma_filter(closes, 120)
 
     # S1 optimized: stop loss + ATR% filter
     trades1_opt = backtest_strategy1(dates, closes, therm_vals,
@@ -410,7 +410,7 @@ def run_backtest(symbol: str, df: pd.DataFrame, therm_vals: np.ndarray = None,
 
     r1_opt = StrategyResult(symbol=symbol, strategy="超买动量优化 (止损20%+ATR≥2%)", trades=trades1_opt)
     r2a_opt = StrategyResult(symbol=symbol, strategy="超卖反转优化A (止损20%+SPX趋势)", trades=trades2a_opt)
-    r2b_opt = StrategyResult(symbol=symbol, strategy="超卖反转优化B (止损20%+个股SMA50)", trades=trades2b_opt)
+    r2b_opt = StrategyResult(symbol=symbol, strategy="超卖反转优化B (止损20%+个股SMA120)", trades=trades2b_opt)
 
     return r1, r2, r1_opt, r2a_opt, r2b_opt
 
