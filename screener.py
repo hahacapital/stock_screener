@@ -1,12 +1,13 @@
 """
-Stock Screener — scan NASDAQ + NYSE for 温度计 signals.
+Stock Screener — scan stocks, crypto, and commodities for 温度计 signals.
 
-Strategy 1 (超买动量): thermometer crosses UP through 76 today
+Strategy 1 (超买动量): thermometer crosses UP through 76 today (ATR% >= 2.0)
 Strategy 2 (超卖反转): thermometer was below 28 and turns upward today
 
 Usage:
-    python screener.py                # scan both strategies
-    python screener.py --top 30       # show top 30 per strategy
+    python screener.py                        # scan both strategies
+    python screener.py --strategy 1 --top 20  # strategy 1 only, top 20
+    python screener.py --strategy 2           # strategy 2 only
 """
 
 import argparse
@@ -18,11 +19,77 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+from backtest import run_backtest
 from indicators import compute_thermometer
 
 
 # ---------------------------------------------------------------------------
-# 1. Get all NASDAQ + NYSE tickers
+# Extra tickers (crypto + commodities, not in NASDAQ/NYSE lists)
+# ---------------------------------------------------------------------------
+
+EXTRA_TICKERS = [
+    # Commodities futures
+    "GC=F", "SI=F", "CL=F", "NG=F", "HG=F", "PL=F",
+    # Crypto (Yahoo Finance format, market cap > 1B as of 2026-03)
+    "BTC-USD", "ETH-USD", "USDT-USD", "BNB-USD", "XRP-USD",
+    "USDC-USD", "SOL-USD", "TRX-USD", "DOGE-USD", "HYPE32196-USD",
+    "ADA-USD", "BCH-USD", "LEO-USD", "LINK-USD", "XMR-USD",
+    "XLM-USD", "DAI-USD", "LTC-USD", "AVAX-USD", "HBAR-USD",
+    "ZEC-USD", "TAO22974-USD", "SUI20947-USD", "SHIB-USD", "TON11419-USD",
+    "CRO-USD", "UNI7083-USD", "DOT-USD", "OKB-USD", "MNT27075-USD",
+    "PAXG-USD",
+]
+
+EXTRA_TICKERS_SET = set(EXTRA_TICKERS)
+
+# ---------------------------------------------------------------------------
+# Chinese names for common tickers
+# ---------------------------------------------------------------------------
+
+CN_NAMES = {
+    # US mega-caps
+    "AAPL": "苹果", "MSFT": "微软", "GOOGL": "谷歌", "GOOG": "谷歌",
+    "AMZN": "亚马逊", "NVDA": "英伟达", "META": "Meta", "TSLA": "特斯拉",
+    "BRK-A": "伯克希尔", "BRK-B": "伯克希尔", "TSM": "台积电",
+    "V": "Visa", "MA": "万事达", "JNJ": "强生", "WMT": "沃尔玛",
+    "JPM": "摩根大通", "PG": "宝洁", "UNH": "联合健康", "HD": "家得宝",
+    "XOM": "埃克森美孚", "CVX": "雪佛龙", "KO": "可口可乐", "PEP": "百事",
+    "ABBV": "艾伯维", "MRK": "默克", "LLY": "礼来", "AVGO": "博通",
+    "COST": "开市客", "ADBE": "Adobe", "CRM": "Salesforce", "NKE": "耐克",
+    "NFLX": "奈飞", "DIS": "迪士尼", "PYPL": "PayPal", "INTC": "英特尔",
+    "AMD": "AMD", "QCOM": "高通", "TXN": "德州仪器", "AMAT": "应用材料",
+    "ORCL": "甲骨文", "IBM": "IBM", "CSCO": "思科", "UBER": "优步",
+    "BA": "波音", "GE": "通用电气", "CAT": "卡特彼勒", "DE": "约翰迪尔",
+    "GS": "高盛", "MS": "摩根士丹利", "BAC": "美国银行", "C": "花旗",
+    "WFC": "富国银行", "SCHW": "嘉信理财", "BLK": "贝莱德",
+    "PLTR": "Palantir", "ANET": "Arista", "HOOD": "Robinhood",
+    "MU": "美光", "RKLB": "火箭实验室", "COIN": "Coinbase",
+    "SNOW": "Snowflake", "SQ": "Block", "SHOP": "Shopify",
+    "SPOT": "Spotify", "SNAP": "Snapchat", "PINS": "Pinterest",
+    "BABA": "阿里巴巴", "JD": "京东", "PDD": "拼多多", "BIDU": "百度",
+    "NIO": "蔚来", "XPEV": "小鹏", "LI": "理想", "BILI": "哔哩哔哩",
+    "TME": "腾讯音乐", "ZTO": "中通快递", "VIPS": "唯品会",
+    # Commodities
+    "GC=F": "黄金期货", "SI=F": "白银期货", "CL=F": "原油期货",
+    "NG=F": "天然气期货", "HG=F": "铜期货", "PL=F": "铂金期货",
+    # Crypto
+    "BTC-USD": "比特币", "ETH-USD": "以太坊", "USDT-USD": "泰达币",
+    "BNB-USD": "币安币", "XRP-USD": "瑞波币", "USDC-USD": "USD Coin",
+    "SOL-USD": "Solana", "TRX-USD": "波场", "DOGE-USD": "狗狗币",
+    "HYPE32196-USD": "Hyperliquid", "ADA-USD": "卡尔达诺",
+    "BCH-USD": "比特币现金", "LEO-USD": "LEO", "LINK-USD": "Chainlink",
+    "XMR-USD": "门罗币", "XLM-USD": "恒星币", "DAI-USD": "DAI",
+    "LTC-USD": "莱特币", "AVAX-USD": "Avalanche", "HBAR-USD": "Hedera",
+    "ZEC-USD": "Zcash", "TAO22974-USD": "Bittensor",
+    "SUI20947-USD": "Sui", "SHIB-USD": "柴犬币",
+    "TON11419-USD": "Toncoin", "CRO-USD": "Cronos",
+    "UNI7083-USD": "Uniswap", "DOT-USD": "波卡",
+    "OKB-USD": "OKB", "MNT27075-USD": "Mantle", "PAXG-USD": "PAX Gold",
+}
+
+
+# ---------------------------------------------------------------------------
+# 1. Get all tickers (stocks + extras)
 # ---------------------------------------------------------------------------
 
 def get_exchange_tickers() -> tuple[list[str], dict[str, str]]:
@@ -144,9 +211,11 @@ def _fetch_fmp_profiles(symbols: list[str]) -> dict[str, dict]:
     """Fetch company profiles from FMP (name, sector, industry, marketCap).
 
     Free tier: 250 requests/day. Each symbol = 1 request.
+    Skip EXTRA_TICKERS (FMP won't have them).
     """
     result = {}
-    for i, sym in enumerate(symbols):
+    stock_symbols = [s for s in symbols if s not in EXTRA_TICKERS_SET]
+    for i, sym in enumerate(stock_symbols):
         try:
             resp = requests.get(
                 FMP_PROFILE_URL,
@@ -166,7 +235,7 @@ def _fetch_fmp_profiles(symbols: list[str]) -> dict[str, dict]:
                     }
                     continue
             elif resp.status_code == 429:
-                print(f"\n  [WARN] FMP rate limit at {i}/{len(symbols)}, stopping.", end="")
+                print(f"\n  [WARN] FMP rate limit at {i}/{len(stock_symbols)}, stopping.", end="")
                 break
         except Exception:
             pass
@@ -175,9 +244,10 @@ def _fetch_fmp_profiles(symbols: list[str]) -> dict[str, dict]:
 
 
 def enrich_signals(df: pd.DataFrame, name_map: dict[str, str]) -> pd.DataFrame:
-    """Add company name, sector, industry, and market cap via FMP API.
+    """Add company name, Chinese name, sector, industry, market cap, and backtest data.
 
-    Falls back to NASDAQ FTP name_map for tickers not covered by FMP.
+    - Stocks: FMP API for metadata, filter market_cap >= 1B
+    - EXTRA_TICKERS: skip market cap filter
     """
     if df.empty:
         return df
@@ -185,23 +255,50 @@ def enrich_signals(df: pd.DataFrame, name_map: dict[str, str]) -> pd.DataFrame:
     df = df.copy()
     tickers = df["ticker"].tolist()
 
-    # FMP free tier: 250 req/day. Fetch top tickers, rest use NASDAQ FTP name only.
+    # FMP profiles (only for stocks, not extras)
+    stock_tickers = [t for t in tickers if t not in EXTRA_TICKERS_SET]
     fmp_limit = 200
-    fetch_tickers = tickers[:fmp_limit] if len(tickers) > fmp_limit else tickers
-    if len(tickers) > fmp_limit:
-        print(f"  Fetching profiles for top {fmp_limit}/{len(tickers)} tickers (FMP)...", end="", flush=True)
+    fetch_tickers = stock_tickers[:fmp_limit] if len(stock_tickers) > fmp_limit else stock_tickers
+    if fetch_tickers:
+        print(f"  Fetching profiles for {len(fetch_tickers)} stock tickers (FMP)...", end="", flush=True)
+        profiles = _fetch_fmp_profiles(fetch_tickers)
+        print(" done.")
     else:
-        print(f"  Fetching profiles for {len(tickers)} tickers (FMP)...", end="", flush=True)
-    profiles = _fetch_fmp_profiles(fetch_tickers)
-    print(" done.")
+        profiles = {}
 
     df["name"] = df["ticker"].apply(
         lambda s: profiles.get(s, {}).get("companyName", "") or name_map.get(s, "")
     )
     df["name"] = df["name"].str.slice(0, 40)
+    df["cn_name"] = df["ticker"].apply(lambda s: CN_NAMES.get(s, ""))
     df["sector"] = df["ticker"].apply(lambda s: profiles.get(s, {}).get("sector", ""))
     df["industry"] = df["ticker"].apply(lambda s: profiles.get(s, {}).get("industry", ""))
     df["market_cap"] = df["ticker"].apply(lambda s: profiles.get(s, {}).get("marketCap", 0))
+
+    # For extras, set sector/industry from type
+    for idx, row in df.iterrows():
+        sym = row["ticker"]
+        if sym in EXTRA_TICKERS_SET:
+            if sym.endswith("-USD"):
+                df.at[idx, "sector"] = "Crypto"
+                df.at[idx, "industry"] = "Cryptocurrency"
+            elif sym.endswith("=F"):
+                df.at[idx, "sector"] = "Commodities"
+                df.at[idx, "industry"] = "Futures"
+
+    # Market cap filter: stocks must be >= 1B, extras exempt
+    is_extra = df["ticker"].isin(EXTRA_TICKERS_SET)
+    df = df[(df["market_cap"] >= 1e9) | is_extra].reset_index(drop=True)
+
+    # Filter out ETFs
+    etf_tickers = set()
+    for sym in df["ticker"]:
+        if sym not in EXTRA_TICKERS_SET:
+            profile = profiles.get(sym, {})
+            if profile.get("isEtf", False):
+                etf_tickers.add(sym)
+    if etf_tickers:
+        df = df[~df["ticker"].isin(etf_tickers)].reset_index(drop=True)
 
     def fmt_cap(val):
         if not val or val == 0:
@@ -220,20 +317,82 @@ def enrich_signals(df: pd.DataFrame, name_map: dict[str, str]) -> pd.DataFrame:
     return df
 
 
-def scan_signals(all_data: dict[str, pd.DataFrame]) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _run_backtest_for_signal(sym: str, strategy: int) -> dict:
+    """Download full history and run backtest for a single ticker.
+
+    Returns dict with backtest metrics for the specified strategy.
     """
-    Scan all stocks for two types of signals.
+    try:
+        df = yf.download(sym, start="2009-01-01", auto_adjust=True, progress=False)
+        if df.empty or len(df) < 60:
+            return {}
+        if isinstance(df.columns, pd.MultiIndex):
+            df = df.droplevel("Ticker", axis=1)
+        df.columns = [c.lower() for c in df.columns]
 
-    Strategy 1 (超买动量): today > 76 AND yesterday <= 76
-    Strategy 2 (超卖反转): recently was below 28, today turns up (today > yesterday)
-                           while still in the "below 28 zone" (not yet crossed 51)
+        r1, r2 = run_backtest(sym, df)
+        r = r1 if strategy == 1 else r2
 
+        if not r.trades:
+            return {"bt_trades": 0, "bt_win_rate": 0, "bt_total_pnl": 0, "bt_pf": 0, "bt_max_dd": 0}
+
+        pnls = [t.pnl_pct for t in r.trades]
+        equity = 100.0
+        peak = equity
+        max_dd = 0.0
+        for p in pnls:
+            equity *= (1 + p / 100)
+            if equity > peak:
+                peak = equity
+            dd = (peak - equity) / peak * 100
+            if dd > max_dd:
+                max_dd = dd
+
+        pf = r.profit_factor
+        return {
+            "bt_trades": r.num_trades,
+            "bt_win_rate": round(r.win_rate, 1),
+            "bt_total_pnl": round(r.total_pnl, 1),
+            "bt_pf": round(pf, 2) if pf != float("inf") else "inf",
+            "bt_max_dd": round(max_dd, 1),
+        }
+    except Exception:
+        return {}
+
+
+def add_backtest_data(df: pd.DataFrame, strategy: int) -> pd.DataFrame:
+    """Add historical backtest columns for each ticker in the signal DataFrame."""
+    if df.empty:
+        return df
+
+    df = df.copy()
+    tickers = df["ticker"].tolist()
+    print(f"  Running backtests for {len(tickers)} tickers...", end="", flush=True)
+
+    bt_data = {}
+    for sym in tickers:
+        bt_data[sym] = _run_backtest_for_signal(sym, strategy)
+
+    for col in ["bt_trades", "bt_win_rate", "bt_total_pnl", "bt_pf", "bt_max_dd"]:
+        df[col] = df["ticker"].apply(lambda s: bt_data.get(s, {}).get(col, ""))
+
+    print(" done.")
+    return df
+
+
+def scan_signals(all_data: dict[str, pd.DataFrame], strategy: str = "all") -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Scan all stocks for signals.
+
+    strategy: "1", "2", or "all"
     Returns (strategy1_df, strategy2_df)
     """
     s1_results = []
     s2_results = []
     errors = 0
     total = len(all_data)
+    run_s1 = strategy in ("1", "all")
+    run_s2 = strategy in ("2", "all")
 
     for idx, (sym, df) in enumerate(all_data.items()):
         if (idx + 1) % 500 == 0:
@@ -254,85 +413,82 @@ def scan_signals(all_data: dict[str, pd.DataFrame]) -> tuple[pd.DataFrame, pd.Da
                          if hasattr(df.index[-1], "strftime") else str(df.index[-1]))
             last_close = float(df["close"].iloc[-1])
 
-            # Compute ATR%(14) for volatility filter
-            high = df["high"].astype(float).values
-            low = df["low"].astype(float).values
-            close_arr = df["close"].astype(float).values
-            prev_close = np.roll(close_arr, 1)
-            prev_close[0] = close_arr[0]
-            tr = np.maximum(high - low, np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)))
-            atr = pd.Series(tr).rolling(14).mean().values
-            cur_atr_pct = atr[-1] / close_arr[-1] * 100 if close_arr[-1] > 0 else 0
+            if run_s1:
+                # Compute ATR%(14) for volatility filter
+                high = df["high"].astype(float).values
+                low = df["low"].astype(float).values
+                close_arr = df["close"].astype(float).values
+                prev_close = np.roll(close_arr, 1)
+                prev_close[0] = close_arr[0]
+                tr = np.maximum(high - low, np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)))
+                atr = pd.Series(tr).rolling(14).mean().values
+                cur_atr_pct = atr[-1] / close_arr[-1] * 100 if close_arr[-1] > 0 else 0
 
-            # --- Strategy 1: cross above 76 ---
-            # Must simulate position state: only signal if NOT already in a trade
-            # (i.e. previous cross above 76 must have been closed by crossing below 68)
-            in_pos = False
-            signal_today = False
-            for k in range(1, len(vals)):
-                vk = vals[k]
-                vk1 = vals[k - 1]
-                if np.isnan(vk) or np.isnan(vk1):
-                    continue
-                if not in_pos:
-                    if vk > 76 and vk1 <= 76:
-                        in_pos = True
-                        if k == len(vals) - 1:
-                            signal_today = True
-                else:
-                    if vk < 68 and vk1 >= 68:
-                        in_pos = False
-
-            # ATR% filter: skip low-volatility signals
-            if signal_today and cur_atr_pct < 2.0:
+                # Strategy 1: cross above 76 with position state tracking
+                in_pos = False
                 signal_today = False
+                for k in range(1, len(vals)):
+                    vk = vals[k]
+                    vk1 = vals[k - 1]
+                    if np.isnan(vk) or np.isnan(vk1):
+                        continue
+                    if not in_pos:
+                        if vk > 76 and vk1 <= 76:
+                            in_pos = True
+                            if k == len(vals) - 1:
+                                signal_today = True
+                    else:
+                        if vk < 68 and vk1 >= 68:
+                            in_pos = False
 
-            if signal_today:
-                s1_results.append({
-                    "ticker": sym,
-                    "date": last_date,
-                    "close": round(last_close, 2),
-                    "thermometer": round(today, 2),
-                    "prev": round(yesterday, 2),
-                    "atr_pct": round(cur_atr_pct, 2),
-                })
+                # ATR% filter
+                if signal_today and cur_atr_pct < 2.0:
+                    signal_today = False
 
-            # --- Strategy 2: below 28 zone, turning up ---
-            # Simulate position state: buy when below 28 and turning up,
-            # sell when crossing above 51 or dropping below 28 again.
-            # Only report signal if a NEW buy triggers on the last bar.
-            in_pos2 = False
-            signal_today2 = False
-            recent_low2 = np.nan
-            for k in range(1, len(vals)):
-                vk = vals[k]
-                vk1 = vals[k - 1]
-                if np.isnan(vk) or np.isnan(vk1):
-                    continue
-                if not in_pos2:
-                    if vk1 < 28 and vk > vk1:
-                        in_pos2 = True
-                        recent_low2 = float(np.nanmin(vals[max(0, k - 20):k + 1]))
-                        if k == len(vals) - 1:
-                            signal_today2 = True
-                else:
-                    if (vk > 51 and vk1 <= 51) or (vk < 28 and vk1 >= 28):
-                        in_pos2 = False
+                if signal_today:
+                    s1_results.append({
+                        "ticker": sym,
+                        "date": last_date,
+                        "close": round(last_close, 2),
+                        "thermometer": round(today, 2),
+                        "prev": round(yesterday, 2),
+                        "atr_pct": round(cur_atr_pct, 2),
+                    })
 
-            if signal_today2:
-                s2_results.append({
-                    "ticker": sym,
-                    "date": last_date,
-                    "close": round(last_close, 2),
-                    "thermometer": round(today, 2),
-                    "prev": round(yesterday, 2),
-                    "recent_low": round(recent_low2, 2),
-                })
+            if run_s2:
+                # Strategy 2: below 28 zone, turning up with position state tracking
+                in_pos2 = False
+                signal_today2 = False
+                recent_low2 = np.nan
+                for k in range(1, len(vals)):
+                    vk = vals[k]
+                    vk1 = vals[k - 1]
+                    if np.isnan(vk) or np.isnan(vk1):
+                        continue
+                    if not in_pos2:
+                        if vk1 < 28 and vk > vk1:
+                            in_pos2 = True
+                            recent_low2 = float(np.nanmin(vals[max(0, k - 20):k + 1]))
+                            if k == len(vals) - 1:
+                                signal_today2 = True
+                    else:
+                        if (vk > 51 and vk1 <= 51) or (vk < 28 and vk1 >= 28):
+                            in_pos2 = False
+
+                if signal_today2:
+                    s2_results.append({
+                        "ticker": sym,
+                        "date": last_date,
+                        "close": round(last_close, 2),
+                        "thermometer": round(today, 2),
+                        "prev": round(yesterday, 2),
+                        "recent_low": round(recent_low2, 2),
+                    })
 
         except Exception:
             errors += 1
 
-    print(f"\r  Scanned {total} stocks ({errors} errors).                    ")
+    print(f"\r  Scanned {total} tickers ({errors} errors).                    ")
 
     cols1 = ["ticker", "date", "close", "thermometer", "prev", "atr_pct"]
     cols2 = ["ticker", "date", "close", "thermometer", "prev", "recent_low"]
@@ -354,6 +510,8 @@ def scan_signals(all_data: dict[str, pd.DataFrame]) -> tuple[pd.DataFrame, pd.Da
 
 def main():
     parser = argparse.ArgumentParser(description="温度计 stock screener")
+    parser.add_argument("--strategy", type=str, default="all", choices=["1", "2", "all"],
+                        help="Which strategy to scan: 1, 2, or all (default: all)")
     parser.add_argument("--top", type=int, default=0,
                         help="Show only top N results per strategy (default: all)")
     parser.add_argument("--days", type=int, default=120,
@@ -362,25 +520,27 @@ def main():
                         help="Tickers per download batch (default: 200)")
     args = parser.parse_args()
 
+    strat_desc = {"1": "Strategy 1 only", "2": "Strategy 2 only", "all": "All strategies"}
     print("=== 温度计 Stock Screener ===")
-    print("Strategy 1: cross above 76 (超买动量)")
-    print("Strategy 2: below 28 turn up (超卖反转)")
+    print(f"Mode: {strat_desc[args.strategy]}")
     print()
 
-    print("[1/4] Fetching NASDAQ + NYSE ticker list...")
+    print("[1/5] Fetching NASDAQ + NYSE ticker list...")
     tickers, name_map = get_exchange_tickers()
-    print(f"  Found {len(tickers)} tickers.")
+    # Add extra tickers (crypto + commodities)
+    all_tickers = tickers + [t for t in EXTRA_TICKERS if t not in tickers]
+    print(f"  Found {len(tickers)} stocks + {len(EXTRA_TICKERS)} extras = {len(all_tickers)} total.")
     print()
 
-    print("[2/4] Downloading OHLC data...")
-    all_data = download_ohlc(tickers, days=args.days, batch_size=args.batch)
+    print("[2/5] Downloading OHLC data...")
+    all_data = download_ohlc(all_tickers, days=args.days, batch_size=args.batch)
     print()
 
-    print("[3/4] Scanning for signals...")
-    s1, s2 = scan_signals(all_data)
+    print("[3/5] Scanning for signals...")
+    s1, s2 = scan_signals(all_data, strategy=args.strategy)
 
-    # Enrich with company info
-    print("\n[4/4] Fetching company info...")
+    # Enrich with company info + market cap filter
+    print("\n[4/5] Fetching company info & filtering (market cap >= 1B)...")
     s1 = enrich_signals(s1, name_map)
     s2 = enrich_signals(s2, name_map)
 
@@ -388,30 +548,43 @@ def main():
         s1 = s1.head(args.top)
         s2 = s2.head(args.top)
 
-    display_cols1 = ["ticker", "name", "sector", "industry", "mkt_cap_fmt", "close", "thermometer", "atr_pct"]
-    display_cols2 = ["ticker", "name", "sector", "industry", "mkt_cap_fmt", "close", "thermometer", "recent_low"]
+    # Add backtest data
+    print("\n[5/5] Running historical backtests...")
+    if not s1.empty:
+        s1 = add_backtest_data(s1, strategy=1)
+    if not s2.empty:
+        s2 = add_backtest_data(s2, strategy=2)
 
-    print()
-    print("=" * 100)
-    print("Strategy 1 — 超买动量 (cross above 76)")
-    print("=" * 100)
-    if s1.empty:
-        print("  No signals today.")
-    else:
-        print(f"  Found {len(s1)} signal(s), sorted by market cap:\n")
-        cols = [c for c in display_cols1 if c in s1.columns]
-        print(s1[cols].to_string(index=False))
+    display_cols1 = ["ticker", "name", "cn_name", "industry", "mkt_cap_fmt",
+                     "close", "thermometer", "atr_pct",
+                     "bt_trades", "bt_win_rate", "bt_total_pnl", "bt_pf", "bt_max_dd"]
+    display_cols2 = ["ticker", "name", "cn_name", "industry", "mkt_cap_fmt",
+                     "close", "thermometer", "recent_low",
+                     "bt_trades", "bt_win_rate", "bt_total_pnl", "bt_pf", "bt_max_dd"]
 
-    print()
-    print("=" * 100)
-    print("Strategy 2 — 超卖反转 (below 28, turning up)")
-    print("=" * 100)
-    if s2.empty:
-        print("  No signals today.")
-    else:
-        print(f"  Found {len(s2)} signal(s), sorted by market cap:\n")
-        cols = [c for c in display_cols2 if c in s2.columns]
-        print(s2[cols].to_string(index=False))
+    if args.strategy in ("1", "all"):
+        print()
+        print("=" * 120)
+        print("Strategy 1 — 超买动量 (cross above 76 | stop 20% | ATR%≥2.0)")
+        print("=" * 120)
+        if s1.empty:
+            print("  No signals today.")
+        else:
+            print(f"  Found {len(s1)} signal(s), sorted by market cap:\n")
+            cols = [c for c in display_cols1 if c in s1.columns]
+            print(s1[cols].to_string(index=False))
+
+    if args.strategy in ("2", "all"):
+        print()
+        print("=" * 120)
+        print("Strategy 2 — 超卖反转 (below 28, turning up | stop 20%)")
+        print("=" * 120)
+        if s2.empty:
+            print("  No signals today.")
+        else:
+            print(f"  Found {len(s2)} signal(s), sorted by market cap:\n")
+            cols = [c for c in display_cols2 if c in s2.columns]
+            print(s2[cols].to_string(index=False))
 
     print()
     print("Done.")
