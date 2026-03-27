@@ -318,13 +318,10 @@ def generate_report(all_results, regime, run_date):
     md.append(f"- **熊市 (Bear)**: S&P 500 收盘价 < SMA({SMA_LENGTH})\n")
 
     # --- Strategy 1 ---
-    md.append("---\n\n## 策略1: 超买动量 (上穿76买入 → 下穿68卖出)\n")
-
-    data = _collect_strategy_section(all_results, regime, 1)  # r1
-    _append_strategy_block(md, "原始版", *data)
+    md.append("---\n\n## 策略1: 超买动量 (上穿76买入 → 下穿68卖出 | 止损20% | ATR%≥2.0)\n")
 
     data_opt = _collect_strategy_section(all_results, regime, 3)  # r1_opt
-    _append_strategy_block(md, "优化版 (止损20% + ATR%≥2.0)", *data_opt)
+    _append_strategy_block(md, "汇总", *data_opt)
 
     md.append("### 个股交易明细\n")
     for item in all_results:
@@ -334,14 +331,11 @@ def generate_report(all_results, regime, run_date):
     # --- Strategy 2 ---
     md.append("---\n\n## 策略2: 超卖反转 (下穿28拐头买入 → 上穿51或再穿28卖出)\n")
 
-    data = _collect_strategy_section(all_results, regime, 2)  # r2
-    _append_strategy_block(md, "原始版", *data)
-
     data_a = _collect_strategy_section(all_results, regime, 4)  # r2a_opt
-    _append_strategy_block(md, "优化版A (止损20% + SPX趋势过滤)", *data_a)
+    _append_strategy_block(md, "方案A (止损20% + SPX趋势过滤)", *data_a)
 
     data_b = _collect_strategy_section(all_results, regime, 5)  # r2b_opt
-    _append_strategy_block(md, "优化版B (止损20% + 个股SMA50过滤)", *data_b)
+    _append_strategy_block(md, "方案B (止损20% + 个股SMA120过滤)", *data_b)
 
     md.append("### 个股交易明细\n")
     for item in all_results:
@@ -371,14 +365,12 @@ def generate_stock_detail(sym, r1, r2, r1_opt, r2a_opt, r2b_opt, regime, run_dat
     md.append(f"**生成日期**: {run_date}")
     md.append(f"[← 返回汇总报告](backtest_report.md)\n")
 
-    md.append("## 策略1: 超买动量 (上穿76买入 → 下穿68卖出)\n")
-    _detail_section(md, "原始版", r1, regime)
-    _detail_section(md, "优化版 (止损20% + ATR%≥2.0)", r1_opt, regime)
+    md.append("## 策略1: 超买动量 (上穿76买入 → 下穿68卖出 | 止损20% | ATR%≥2.0)\n")
+    _detail_section(md, "交易明细", r1_opt, regime)
 
     md.append("## 策略2: 超卖反转 (下穿28拐头买入 → 上穿51或再穿28卖出)\n")
-    _detail_section(md, "原始版", r2, regime)
-    _detail_section(md, "优化版A (止损20% + SPX趋势过滤)", r2a_opt, regime)
-    _detail_section(md, "优化版B (止损20% + 个股SMA50过滤)", r2b_opt, regime)
+    _detail_section(md, "方案A (止损20% + SPX趋势过滤)", r2a_opt, regime)
+    _detail_section(md, "方案B (止损20% + 个股SMA120过滤)", r2b_opt, regime)
 
     return "\n".join(md)
 
