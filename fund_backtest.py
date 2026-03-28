@@ -87,23 +87,131 @@ def get_sp500_tickers() -> list[str]:
         return []
 
 
-def get_universe(name: str, custom_tickers: str = "") -> list[str]:
-    """Get ticker list for the specified universe."""
+def get_sp500_historical() -> tuple[list[str], dict[str, set]]:
+    """Fetch current S&P 500 + historical changes from Wikipedia.
+
+    Returns:
+        (all_ever_tickers, membership_by_date)
+        - all_ever_tickers: all tickers that were ever in S&P 500 (for data download)
+        - membership_by_date: dict mapping date_str -> set of member tickers
+          We store membership snapshots at each change date.
+          To look up membership at a given date, use the most recent snapshot <= that date.
+    """
+    try:
+        resp = requests.get(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        tables = pd.read_html(StringIO(resp.text))
+    except Exception as e:
+        print(f"[WARN] Could not fetch S&P 500 data: {e}")
+        return [], {}
+
+    # Current members
+    current = set(tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist())
+
+    # Parse changes table (columns are MultiIndex)
+    if len(tables) < 2:
+        return sorted(current), {}
+
+    changes = tables[1]
+    # Flatten MultiIndex columns
+    changes.columns = ["date", "added_ticker", "added_name", "removed_ticker", "removed_name", "reason"]
+    changes["added_ticker"] = changes["added_ticker"].str.replace(".", "-", regex=False)
+    changes["removed_ticker"] = changes["removed_ticker"].str.replace(".", "-", regex=False)
+
+    # Parse dates and sort chronologically (newest first in table)
+    change_records = []
+    for _, row in changes.iterrows():
+        try:
+            dt = pd.to_datetime(row["date"])
+            added = str(row["added_ticker"]).strip() if pd.notna(row["added_ticker"]) else ""
+            removed = str(row["removed_ticker"]).strip() if pd.notna(row["removed_ticker"]) else ""
+            if added or removed:
+                change_records.append((dt, added, removed))
+        except Exception:
+            continue
+
+    # Sort oldest first
+    change_records.sort(key=lambda x: x[0])
+
+    # Reconstruct historical membership by replaying changes backward from current
+    # Start with current set, undo changes from newest to oldest
+    members = set(current)
+    all_ever = set(current)
+
+    # Build snapshots: walk backward in time
+    snapshots = []  # [(date, frozenset_of_members)]
+    snapshots.append((pd.Timestamp("2099-01-01"), frozenset(members)))  # sentinel
+
+    for dt, added, removed in reversed(change_records):
+        # Undo: if ticker was added on this date, remove it (it wasn't there before)
+        if added and added in members:
+            members.discard(added)
+        # Undo: if ticker was removed on this date, add it back (it was there before)
+        if removed:
+            members.add(removed)
+            all_ever.add(removed)
+        snapshots.append((dt, frozenset(members)))
+
+    snapshots.sort(key=lambda x: x[0])
+
+    print(f"  S&P 500 historical: {len(change_records)} changes, "
+          f"{len(all_ever)} unique tickers ever in index")
+
+    return sorted(all_ever), snapshots
+
+
+def _get_sp500_members_at(snapshots: list, date: pd.Timestamp) -> set:
+    """Get S&P 500 members at a given date using pre-built snapshots."""
+    if not snapshots:
+        return set()
+    # Binary search for latest snapshot <= date
+    result = snapshots[0][1]
+    for snap_date, members in snapshots:
+        if snap_date <= date:
+            result = members
+        else:
+            break
+    return set(result)
+
+
+def get_universe(name: str, custom_tickers: str = "", historical: bool = False):
+    """Get ticker list for the specified universe.
+
+    If historical=True and name starts with 'sp500', returns
+    (all_ever_tickers, snapshots) for survivorship-bias-free backtesting.
+    Otherwise returns a plain list of tickers.
+    """
     if name in ("sp500", "sp500+"):
-        tickers = get_sp500_tickers()
-        if not tickers:
-            print("Falling back to report tickers.")
-            tickers = list(REPORT_TICKERS)
-        if name == "sp500+":
-            existing = set(tickers)
-            tickers += [t for t in EXTRA_TICKERS if t not in existing]
-        return tickers
+        if historical:
+            all_ever, snapshots = get_sp500_historical()
+            if not all_ever:
+                print("  Historical fetch failed, falling back to current members.")
+                tickers = get_sp500_tickers() or list(REPORT_TICKERS)
+                return tickers, []
+            if name == "sp500+":
+                existing = set(all_ever)
+                all_ever = all_ever + [t for t in EXTRA_TICKERS if t not in existing]
+            return all_ever, snapshots
+        else:
+            tickers = get_sp500_tickers()
+            if not tickers:
+                print("Falling back to report tickers.")
+                tickers = list(REPORT_TICKERS)
+            if name == "sp500+":
+                existing = set(tickers)
+                tickers += [t for t in EXTRA_TICKERS if t not in existing]
+            return tickers
     elif name == "report":
-        return REPORT_TICKERS
+        return list(REPORT_TICKERS) if not historical else (list(REPORT_TICKERS), [])
     elif name == "custom":
-        return [t.strip() for t in custom_tickers.split(",") if t.strip()]
+        t = [t.strip() for t in custom_tickers.split(",") if t.strip()]
+        return t if not historical else (t, [])
     else:
-        return REPORT_TICKERS
+        return list(REPORT_TICKERS) if not historical else (list(REPORT_TICKERS), [])
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +515,8 @@ def run_fund(data: dict[str, pd.DataFrame],
              rolling_pf_cache: dict = None,
              trading_dates: set = None,
              rank_method: str = "pf",
-             shares_map: dict = None) -> tuple[list, list]:
+             shares_map: dict = None,
+             sp500_snapshots: list = None) -> tuple[list, list]:
     """
     Run portfolio simulation.
 
@@ -530,8 +639,16 @@ def run_fund(data: dict[str, pd.DataFrame],
                 eff_max = max(1, max_positions // 2)
 
         # --- 4. Check buy signals ---
+        # If historical S&P 500 snapshots provided, filter to members at this date
+        eligible_syms = set(data.keys())
+        if sp500_snapshots:
+            sp500_members = _get_sp500_members_at(sp500_snapshots, date)
+            # Keep commodities (=F) even if not in S&P 500
+            eligible_syms = sp500_members.intersection(eligible_syms) | {
+                s for s in data if s.endswith("=F")}
+
         candidates = []
-        for sym in data:
+        for sym in eligible_syms:
             if sym in positions:
                 continue
             if sym not in jojo_cache:
@@ -575,7 +692,7 @@ def run_fund(data: dict[str, pd.DataFrame],
                 else:
                     cur_pf = static_pf
                 ranked = sorted(candidates, key=lambda x: cur_pf.get(x[0], 0), reverse=True)
-            elif rank_method == "mktcap":
+            elif rank_method in ("mktcap", "mktcap_asc", "mktcap_mid"):
                 # Rank by approx market cap at current date (close × shares outstanding)
                 _sh = shares_map or {}
                 def _approx_mktcap(sym):
@@ -583,10 +700,18 @@ def run_fund(data: dict[str, pd.DataFrame],
                     if s <= 0 or sym not in data or date not in data[sym].index:
                         return 0
                     return float(data[sym].loc[date, "close"]) * s
-                ranked = sorted(candidates, key=lambda x: _approx_mktcap(x[0]), reverse=True)
-            elif rank_method == "jojo":
-                # Rank by jojo value (highest first — strongest momentum)
-                ranked = sorted(candidates, key=lambda x: x[1], reverse=True)
+                if rank_method == "mktcap_mid":
+                    # Sort by cap, then reorder so median-ranked come first
+                    by_cap = sorted(candidates, key=lambda x: _approx_mktcap(x[0]))
+                    mid = len(by_cap) // 2
+                    ranked = sorted(by_cap, key=lambda x: abs(by_cap.index(x) - mid))
+                else:
+                    desc = (rank_method == "mktcap")
+                    ranked = sorted(candidates, key=lambda x: _approx_mktcap(x[0]), reverse=desc)
+            elif rank_method in ("jojo", "jojo_asc"):
+                # jojo: highest first (strongest momentum); jojo_asc: lowest first (just crossed)
+                desc = (rank_method == "jojo")
+                ranked = sorted(candidates, key=lambda x: x[1], reverse=desc)
             else:
                 ranked = candidates
             available_slots = eff_max - len(positions)
@@ -665,7 +790,50 @@ def run_fund(data: dict[str, pd.DataFrame],
 # Metrics
 # ---------------------------------------------------------------------------
 
-def compute_fund_metrics(snapshots, trades, initial_capital):
+def _compute_benchmark_metrics(spx_series: pd.Series, dates: list,
+                               initial_capital: float) -> dict:
+    """Compute SPX buy-and-hold benchmark metrics aligned to fund dates."""
+    # Align SPX to fund dates
+    spx_aligned = spx_series.reindex([d for d in dates], method="ffill").dropna()
+    if len(spx_aligned) < 2:
+        return {}
+    spx_vals = spx_aligned.values
+    spx_equity = initial_capital * spx_vals / spx_vals[0]
+
+    total_ret = (spx_equity[-1] / initial_capital - 1) * 100
+    d = (spx_aligned.index[-1] - spx_aligned.index[0]).days
+    ann_ret = ((spx_equity[-1] / initial_capital) ** (365.25 / d) - 1) * 100 if d > 0 else 0
+
+    peak = np.maximum.accumulate(spx_equity)
+    dd = (peak - spx_equity) / peak * 100
+    max_dd = float(np.max(dd))
+    max_dd_date = spx_aligned.index[int(np.argmax(dd))]
+
+    daily_ret = np.diff(spx_equity) / spx_equity[:-1]
+    sharpe = float(np.mean(daily_ret) / np.std(daily_ret) * np.sqrt(252)) if np.std(daily_ret) > 0 else 0
+    neg_ret = daily_ret[daily_ret < 0]
+    sortino = float(np.mean(daily_ret) / np.std(neg_ret) * np.sqrt(252)) if len(neg_ret) > 0 and np.std(neg_ret) > 0 else 0
+    calmar = ann_ret / max_dd if max_dd > 0 else 0
+
+    eq_series = pd.Series(spx_equity, index=spx_aligned.index)
+    monthly = eq_series.resample("ME").last().pct_change().dropna() * 100
+
+    return {
+        "final_equity": round(spx_equity[-1], 0),
+        "total_return": round(total_ret, 1),
+        "ann_return": round(ann_ret, 1),
+        "max_drawdown": round(max_dd, 1),
+        "max_dd_date": str(max_dd_date)[:10],
+        "sharpe": round(sharpe, 2),
+        "sortino": round(sortino, 2),
+        "calmar": round(calmar, 2),
+        "monthly_returns": monthly,
+        "equity": spx_equity,
+        "dates": spx_aligned.index.tolist(),
+    }
+
+
+def compute_fund_metrics(snapshots, trades, initial_capital, spx_series=None):
     """Compute comprehensive fund performance metrics."""
     if not snapshots:
         return {}
@@ -710,6 +878,14 @@ def compute_fund_metrics(snapshots, trades, initial_capital):
     eq_series = pd.Series(equity, index=dates)
     monthly = eq_series.resample("ME").last().pct_change().dropna() * 100
 
+    # Drawdown series
+    dd_series = pd.Series(dd, index=dates)
+
+    # Benchmark
+    bench = {}
+    if spx_series is not None:
+        bench = _compute_benchmark_metrics(spx_series, dates, initial_capital)
+
     return {
         "initial_capital": initial_capital,
         "final_equity": round(equity[-1], 0),
@@ -731,6 +907,9 @@ def compute_fund_metrics(snapshots, trades, initial_capital):
         "end_date": str(dates[-1])[:10],
         "trading_days": len(dates),
         "monthly_returns": monthly,
+        "drawdown_series": dd_series,
+        "equity_series": eq_series,
+        "benchmark": bench,
     }
 
 
@@ -781,10 +960,24 @@ def print_summary(metrics, config_str):
     print(f"  资金利用率:     {m['capital_utilization']:>13.1f}%")
     print("=" * 70)
 
+    # Benchmark comparison
+    bench = m.get("benchmark", {})
+    if bench:
+        print("\n  业绩基准 (SPX 500 买入持有):")
+        print("-" * 70)
+        print(f"  SPX 终值:       ${bench['final_equity']:>14,.0f}")
+        print(f"  SPX 总收益:     {bench['total_return']:>13.1f}%")
+        print(f"  SPX 年化收益:   {bench['ann_return']:>13.1f}%")
+        print(f"  SPX 最大回撤:   {bench['max_drawdown']:>13.1f}%  ({bench['max_dd_date']})")
+        print(f"  SPX Sharpe:     {bench['sharpe']:>13.2f}")
+        alpha = m['ann_return'] - bench['ann_return']
+        print(f"  超额年化(α):    {alpha:>+13.1f}%")
+        print("=" * 70)
+
     # Monthly returns heatmap
     monthly = m.get("monthly_returns")
     if monthly is not None and len(monthly) > 0:
-        print("\n月度收益率 (%):")
+        print("\n月度收益率 (%) — 策略:")
         print("-" * 70)
         mdf = pd.DataFrame({"ret": monthly})
         mdf["year"] = mdf.index.year
@@ -794,7 +987,32 @@ def print_summary(metrics, config_str):
         yearly = mdf.groupby("year")["ret"].sum()
         pivot["  年度"] = yearly
         print(pivot.to_string(float_format=lambda x: f"{x:>6.1f}"))
-        print()
+
+    # Benchmark monthly heatmap
+    bench_monthly = bench.get("monthly_returns") if bench else None
+    if bench_monthly is not None and len(bench_monthly) > 0:
+        print(f"\n月度收益率 (%) — SPX 基准:")
+        print("-" * 70)
+        bmdf = pd.DataFrame({"ret": bench_monthly})
+        bmdf["year"] = bmdf.index.year
+        bmdf["month"] = bmdf.index.month
+        bpivot = bmdf.pivot_table(values="ret", index="year", columns="month", aggfunc="first")
+        bpivot.columns = [f"{c:>2d}月" for c in bpivot.columns]
+        byearly = bmdf.groupby("year")["ret"].sum()
+        bpivot["  年度"] = byearly
+        print(bpivot.to_string(float_format=lambda x: f"{x:>6.1f}"))
+
+    # Drawdown summary
+    dd_series = m.get("drawdown_series")
+    if dd_series is not None and len(dd_series) > 0:
+        print(f"\n最大回撤 Top 5:")
+        print("-" * 70)
+        # Find distinct drawdown episodes (peaks)
+        dd_monthly = dd_series.resample("ME").max()
+        top_dd = dd_monthly.nlargest(5)
+        for i, (dt, val) in enumerate(top_dd.items(), 1):
+            print(f"  {i}. {str(dt)[:7]}  回撤 {val:.1f}%")
+    print()
 
 
 def print_comparison(results: list[tuple[str, dict]]):
@@ -850,6 +1068,64 @@ def generate_report(metrics, trades, config_str, output_dir="reports"):
     ]
     for label, val in rows:
         md.append(f"| {label} | {val} |")
+
+    # Benchmark comparison
+    bench = m.get("benchmark", {})
+    if bench:
+        md.append("\n## 业绩基准 (SPX 500 买入持有)\n")
+        md.append("| 指标 | 策略 | SPX |")
+        md.append("|------|------|-----|")
+        md.append(f"| 终值 | ${m['final_equity']:,.0f} | ${bench['final_equity']:,.0f} |")
+        md.append(f"| 总收益 | {m['total_return']}% | {bench['total_return']}% |")
+        md.append(f"| 年化收益 | {m['ann_return']}% | {bench['ann_return']}% |")
+        md.append(f"| 最大回撤 | {m['max_drawdown']}% | {bench['max_drawdown']}% |")
+        md.append(f"| Sharpe | {m['sharpe']} | {bench['sharpe']} |")
+        md.append(f"| Sortino | {m['sortino']} | {bench['sortino']} |")
+        alpha = round(m['ann_return'] - bench['ann_return'], 1)
+        md.append(f"| **超额年化(α)** | **{alpha:+.1f}%** | — |")
+
+    def _pivot_to_md(monthly_series):
+        """Convert monthly return series to markdown table."""
+        mdf = pd.DataFrame({"ret": monthly_series})
+        mdf["year"] = mdf.index.year
+        mdf["month"] = mdf.index.month
+        pivot = mdf.pivot_table(values="ret", index="year", columns="month", aggfunc="first")
+        yearly = mdf.groupby("year")["ret"].sum()
+        # Build markdown table manually
+        cols = list(pivot.columns)
+        header = "| 年份 | " + " | ".join(f"{c}月" for c in cols) + " | 年度 |"
+        sep = "|------|" + "|".join("------:" for _ in cols) + "|------:|"
+        rows = [header, sep]
+        for yr in pivot.index:
+            vals = []
+            for c in cols:
+                v = pivot.loc[yr, c]
+                vals.append(f"{v:.1f}" if not pd.isna(v) else "")
+            yr_total = yearly.get(yr, 0)
+            rows.append(f"| {yr} | " + " | ".join(vals) + f" | {yr_total:.1f} |")
+        return "\n".join(rows)
+
+    # Monthly heatmap
+    monthly = m.get("monthly_returns")
+    if monthly is not None and len(monthly) > 0:
+        md.append("\n## 月度收益率 (%) — 策略\n")
+        md.append(_pivot_to_md(monthly))
+
+    bench_monthly = bench.get("monthly_returns") if bench else None
+    if bench_monthly is not None and len(bench_monthly) > 0:
+        md.append("\n## 月度收益率 (%) — SPX 基准\n")
+        md.append(_pivot_to_md(bench_monthly))
+
+    # Drawdown top 5
+    dd_series = m.get("drawdown_series")
+    if dd_series is not None and len(dd_series) > 0:
+        md.append("\n## 最大回撤 Top 5\n")
+        md.append("| # | 月份 | 回撤% |")
+        md.append("|---|------|-------|")
+        dd_monthly = dd_series.resample("ME").max()
+        top_dd = dd_monthly.nlargest(5)
+        for i, (dt, val) in enumerate(top_dd.items(), 1):
+            md.append(f"| {i} | {str(dt)[:7]} | {val:.1f}% |")
 
     # Top trades
     if trades:
@@ -937,10 +1213,12 @@ def main():
     parser.add_argument("--output-dir", type=str, default="reports/",
                         help="Output directory (default: reports/)")
     parser.add_argument("--rank-method", type=str, default="pf",
-                        choices=["pf", "mktcap", "jojo"],
-                        help="Ranking method: pf (default), mktcap, jojo")
+                        choices=["pf", "mktcap", "mktcap_asc", "jojo", "jojo_asc"],
+                        help="Ranking method: pf, mktcap (large first), mktcap_asc (small first), jojo (high first), jojo_asc (low first)")
     parser.add_argument("--rank-compare", action="store_true",
                         help="Compare all rank methods × TopN combinations")
+    parser.add_argument("--historical", action="store_true",
+                        help="Use historical S&P 500 membership (avoid survivorship bias)")
     args = parser.parse_args()
 
     strat_names = {1: "策略1(超买动量)", 2: "策略2(超卖反转)", 3: "策略1+2(全部)"}
@@ -953,8 +1231,14 @@ def main():
 
     # Step 1: Get universe
     print("[1/5] Loading universe...")
-    tickers = get_universe(args.universe, args.tickers)
-    print(f"  Universe: {args.universe} ({len(tickers)} tickers)")
+    sp500_snapshots = []
+    if args.historical:
+        result = get_universe(args.universe, args.tickers, historical=True)
+        tickers, sp500_snapshots = result
+        print(f"  Universe: {args.universe} (historical, {len(tickers)} tickers ever in index)")
+    else:
+        tickers = get_universe(args.universe, args.tickers)
+        print(f"  Universe: {args.universe} ({len(tickers)} tickers)")
 
     # Step 2: Download data (need extra history for rolling PF)
     dl_start = "2010-01-01" if args.pf_window > 0 else args.start
@@ -972,6 +1256,7 @@ def main():
     # Step 4: SPX data (for regime + trading dates)
     print("  Downloading SPX...")
     spx_df = download_spx("2010-01-01")
+    spx_close = spx_df["close"].astype(float) if not spx_df.empty else None
     td = get_trading_dates(spx_df) if not spx_df.empty else None
     if td:
         print(f"  US trading dates: {len(td)} days")
@@ -991,6 +1276,7 @@ def main():
         start_date=args.start, end_date=args.end,
         pf_window=args.pf_window,
         trading_dates=td,
+        sp500_snapshots=sp500_snapshots if sp500_snapshots else None,
     )
 
     if args.rank_compare:
@@ -1035,6 +1321,7 @@ def main():
                     start_date=args.start, end_date=args.end,
                     pf_window=0, trading_dates=td,
                     rank_method=rank_m, shares_map=shares_map,
+                    sp500_snapshots=sp500_snapshots if sp500_snapshots else None,
                 )
                 if rank_m == "pf":
                     if shared_rolling_pf is not None:
@@ -1043,7 +1330,7 @@ def main():
                         run_kwargs["pf_map_override"] = shared_static_pf
 
                 snapshots, trades = run_fund(**run_kwargs)
-                m = compute_fund_metrics(snapshots, trades, args.capital)
+                m = compute_fund_metrics(snapshots, trades, args.capital, spx_close)
                 comparison.append((label, metrics_one_line(m)))
 
         print_comparison(comparison)
@@ -1087,7 +1374,7 @@ def main():
         for label, kw in configs:
             print(f"\n  Running: {label}...")
             snapshots, trades = run_fund(**compare_kwargs, **kw)
-            m = compute_fund_metrics(snapshots, trades, args.capital)
+            m = compute_fund_metrics(snapshots, trades, args.capital, spx_close)
             comparison.append((label, metrics_one_line(m)))
             # Keep the best (highest Sharpe, then Sortino as tiebreaker) for full report
             cur_score = (m.get("sharpe", 0), m.get("sortino", 0))
@@ -1114,7 +1401,7 @@ def main():
         extra_kwargs = {}
         if args.rank_method != "pf":
             extra_kwargs["rank_method"] = args.rank_method
-            if args.rank_method == "mktcap":
+            if args.rank_method in ("mktcap", "mktcap_asc"):
                 print("  Fetching shares outstanding...")
                 extra_kwargs["shares_map"] = fetch_shares_outstanding(list(data.keys()))
         snapshots, trades = run_fund(
@@ -1130,7 +1417,7 @@ def main():
             sys.exit(1)
 
         print(f"\n[5/5] Generating output...")
-        metrics = compute_fund_metrics(snapshots, trades, args.capital)
+        metrics = compute_fund_metrics(snapshots, trades, args.capital, spx_close)
         print_summary(metrics, config_str)
         generate_report(metrics, trades, config_str, args.output_dir)
         export_csv(snapshots, trades, args.output_dir)
