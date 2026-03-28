@@ -57,28 +57,35 @@ python fund_backtest.py --compare --universe sp500+   # 对比4种配置
 
 ## 基金回测 (fund_backtest)
 
-模拟一个最多持有 **5 只股票**的基金组合：
+模拟一个 Top-N 持仓基金组合，每日扫描 jojo 买入/卖出信号，自动选股、开仓、止损。
 
-1. 每日扫描全部标的，检测 jojo 买入/卖出信号
-2. 买入候选按**滚动 Profit Factor**（过去 3 年回测盈亏比）排名，优先选历史表现好的
-3. 等权分配资金（或 ATR% 反比仓位管理）
-4. 止损 20%，可选熊市减仓（SPX < SMA225 时最多持 2 仓）
+### 核心功能
 
-### 4 种配置对比
+1. **多种排名方式**：市值最大/中间/最小、jojo 指标值、滚动 Profit Factor
+2. **历史 S&P 500 成分股**：从 Wikipedia 变更表重建当时的成分股，消除幸存者偏差
+3. **SPX 基准对比**：自动计算超额收益(α)、月度热力图、回撤分析
+4. **可选配置**：熊市减仓、ATR% 动态仓位、止损比例、持仓数量
 
-| 配置 | 说明 |
-|------|------|
-| 基线（滚动PF+等权）| 默认配置，按 PF 排名选股，等权分配 |
-| +熊市减仓 | 熊市时最大持仓从 5 降到 2 |
-| +ATR%动态仓位 | 低波动标的分配更多资金 |
-| +熊市减仓+ATR%动态仓位 | 以上两者叠加 |
+### 回测结果（历史成分股，无幸存者偏差）
+
+| 配置 | 年化% | 最大回撤% | Sharpe |
+|------|-------|-----------|--------|
+| Top10 市值最大 | +7.3 | 25.3 | 0.55 |
+| Top10 市值中间 | +1.8 | 34.9 | 0.19 |
+| Top10 市值最小 | +0.3 | 38.9 | 0.10 |
+| SPX 基准 | +10.8 | 33.9 | 0.66 |
+
+> **注意**：使用当前成分股回测会因幸存者偏差严重高估小盘股收益（Top1 市值最小从 +38.5% 降至 -13.7%）。务必使用 `--historical` 标志。
 
 ```bash
-# 对比4种配置
+# 排名方式 × TopN 对比（推荐加 --historical）
+python fund_backtest.py --rank-compare --universe sp500+ --historical
+
+# 4 种配置对比（基线/熊市减仓/ATR%动态仓位/全部叠加）
 python fund_backtest.py --compare --universe sp500+
 
-# 单独运行某种配置
-python fund_backtest.py --strategy 1 --universe sp500+ --regime-filter --vol-sizing
+# 单独运行
+python fund_backtest.py --strategy 1 --universe sp500+ --max-positions 10 --rank-method mktcap --historical
 ```
 
 ## jojo指标指标详解
