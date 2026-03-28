@@ -133,11 +133,12 @@ def download_ohlc(tickers: list[str], days: int = 120, batch_size: int = 200) ->
     all_data = {}
     total = len(tickers)
 
+    num_batches = (total + batch_size - 1) // batch_size
     for i in range(0, total, batch_size):
         batch = tickers[i : i + batch_size]
+        batch_num = i // batch_size + 1
         pct = min(100, (i + len(batch)) / total * 100)
-        print(f"\r  Downloading batch {i // batch_size + 1} "
-              f"({len(batch)} tickers, {pct:.0f}% total)...", end="", flush=True)
+        print(f"  [{batch_num}/{num_batches}] Downloading {len(batch)} tickers ({pct:.0f}%)...")
 
         try:
             df = yf.download(
@@ -174,7 +175,7 @@ def download_ohlc(tickers: list[str], days: int = 120, batch_size: int = 200) ->
 
         time.sleep(0.5)
 
-    print(f"\r  Downloaded data for {len(all_data)} tickers.                    ")
+    print(f"  Done. Downloaded data for {len(all_data)} / {total} tickers.")
     return all_data
 
 
