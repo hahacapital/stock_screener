@@ -20,7 +20,7 @@ import requests
 import yfinance as yf
 
 from backtest import run_backtest
-from indicators import compute_jojo
+from indicators import compute_jojo, _rma
 
 
 # ---------------------------------------------------------------------------
@@ -454,21 +454,23 @@ def scan_signals(all_data: dict[str, pd.DataFrame], strategy: str = "all") -> tu
             last_date = (df.index[-1].strftime("%Y-%m-%d")
                          if hasattr(df.index[-1], "strftime") else str(df.index[-1]))
             last_close = float(df["close"].iloc[-1])
+            close_arr = df["close"].astype(float).values
 
             if run_s1:
                 # Compute ATR%(14) for volatility filter
                 high = df["high"].astype(float).values
                 low = df["low"].astype(float).values
-                close_arr = df["close"].astype(float).values
                 prev_close = np.roll(close_arr, 1)
                 prev_close[0] = close_arr[0]
                 tr = np.maximum(high - low, np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)))
-                atr = pd.Series(tr).rolling(14).mean().values
+                atr = _rma(pd.Series(tr), 14).values
                 cur_atr_pct = atr[-1] / close_arr[-1] * 100 if close_arr[-1] > 0 else 0
 
                 # Strategy 1: cross above 76 with position state tracking
+                # Includes -20% stop loss to match backtest behavior
                 in_pos = False
                 signal_today = False
+                entry_price_s1 = 0.0
                 for k in range(1, len(vals)):
                     vk = vals[k]
                     vk1 = vals[k - 1]
@@ -477,10 +479,15 @@ def scan_signals(all_data: dict[str, pd.DataFrame], strategy: str = "all") -> tu
                     if not in_pos:
                         if vk > 76 and vk1 <= 76:
                             in_pos = True
+                            entry_price_s1 = close_arr[k]
                             if k == len(vals) - 1:
                                 signal_today = True
                     else:
-                        if vk < 68 and vk1 >= 68:
+                        # Stop loss exit: -20%
+                        if entry_price_s1 > 0 and (close_arr[k] / entry_price_s1 - 1) * 100 <= -20:
+                            in_pos = False
+                        # Signal exit: cross below 68
+                        elif vk < 68 and vk1 >= 68:
                             in_pos = False
 
                 # ATR% filter
@@ -499,9 +506,11 @@ def scan_signals(all_data: dict[str, pd.DataFrame], strategy: str = "all") -> tu
 
             if run_s2:
                 # Strategy 2: below 28 zone, turning up with position state tracking
+                # Includes -20% stop loss to match backtest behavior
                 in_pos2 = False
                 signal_today2 = False
                 recent_low2 = np.nan
+                entry_price_s2 = 0.0
                 for k in range(1, len(vals)):
                     vk = vals[k]
                     vk1 = vals[k - 1]
@@ -510,11 +519,16 @@ def scan_signals(all_data: dict[str, pd.DataFrame], strategy: str = "all") -> tu
                     if not in_pos2:
                         if vk1 < 28 and vk > vk1:
                             in_pos2 = True
+                            entry_price_s2 = close_arr[k]
                             recent_low2 = float(np.nanmin(vals[max(0, k - 20):k + 1]))
                             if k == len(vals) - 1:
                                 signal_today2 = True
                     else:
-                        if (vk > 51 and vk1 <= 51) or (vk < 28 and vk1 >= 28):
+                        # Stop loss exit: -20%
+                        if entry_price_s2 > 0 and (close_arr[k] / entry_price_s2 - 1) * 100 <= -20:
+                            in_pos2 = False
+                        # Signal exits
+                        elif (vk > 51 and vk1 <= 51) or (vk < 28 and vk1 >= 28):
                             in_pos2 = False
 
                 if signal_today2:

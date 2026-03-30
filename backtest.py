@@ -31,7 +31,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from indicators import compute_jojo
+from indicators import compute_jojo, _rma
 
 
 # ---------------------------------------------------------------------------
@@ -124,21 +124,28 @@ class StrategyResult:
 # ---------------------------------------------------------------------------
 
 def backtest_strategy1(dates, closes, therm_vals, *,
-                       stop_loss_pct=None, atr_pct=None, min_atr_pct=None) -> list[Trade]:
+                       stop_loss_pct=None, atr_pct=None, min_atr_pct=None,
+                       opens=None) -> list[Trade]:
     """
     Strategy 1 (超买动量):
         BUY:  jojo crosses above 76 (today > 76 AND yesterday <= 76)
         SELL: jojo drops below 68 (today < 68 AND yesterday >= 68)
 
+    Signal uses bar i close to compute jojo, entry/exit at bar i+1 open
+    to avoid look-ahead bias. Stop loss checked intraday at close.
+
     Optional optimizations:
         stop_loss_pct: fixed stop loss percentage (e.g. 20 means -20%)
         atr_pct + min_atr_pct: skip entry if ATR% < min_atr_pct
+        opens: next-bar open prices for realistic entry/exit
     """
     trades = []
     in_position = False
     entry_date = None
     entry_price = None
     entry_idx = None
+    # If opens not provided, fall back to closes (legacy behavior)
+    exec_prices = opens if opens is not None else closes
 
     for i in range(1, len(therm_vals)):
         t_today = therm_vals[i]
@@ -148,18 +155,21 @@ def backtest_strategy1(dates, closes, therm_vals, *,
             continue
 
         if not in_position:
-            # BUY signal: cross above 76
+            # BUY signal: cross above 76 → enter at next bar open
             if t_today > 76 and t_yesterday <= 76:
                 # ATR% filter
                 if min_atr_pct is not None and atr_pct is not None:
                     if np.isnan(atr_pct[i]) or atr_pct[i] < min_atr_pct:
                         continue
+                # Enter at next bar open to avoid look-ahead bias
+                if i + 1 >= len(therm_vals):
+                    break
                 in_position = True
-                entry_date = str(dates[i])
-                entry_price = closes[i]
-                entry_idx = i
+                entry_date = str(dates[i + 1])
+                entry_price = exec_prices[i + 1]
+                entry_idx = i + 1
         else:
-            # Stop loss check (before normal exit)
+            # Stop loss check at current close (intraday stop)
             if stop_loss_pct is not None:
                 pnl_now = (closes[i] / entry_price - 1) * 100
                 if pnl_now <= -stop_loss_pct:
@@ -177,16 +187,23 @@ def backtest_strategy1(dates, closes, therm_vals, *,
                     in_position = False
                     continue
 
-            # SELL signal: drop below 68
+            # SELL signal: drop below 68 → exit at next bar open
             if t_today < 68 and t_yesterday >= 68:
-                exit_price = closes[i]
+                if i + 1 < len(therm_vals):
+                    exit_price = exec_prices[i + 1]
+                    exit_date = str(dates[i + 1])
+                    exit_idx = i + 1
+                else:
+                    exit_price = closes[i]
+                    exit_date = str(dates[i])
+                    exit_idx = i
                 pnl = (exit_price / entry_price - 1) * 100
                 trades.append(Trade(
                     entry_date=entry_date,
                     entry_price=round(entry_price, 2),
-                    exit_date=str(dates[i]),
+                    exit_date=exit_date,
                     exit_price=round(exit_price, 2),
-                    holding_days=i - entry_idx,
+                    holding_days=exit_idx - entry_idx,
                     pnl_pct=round(pnl, 2),
                     exit_reason="下穿68",
                 ))
@@ -210,21 +227,27 @@ def backtest_strategy1(dates, closes, therm_vals, *,
 
 
 def backtest_strategy2(dates, closes, therm_vals, *,
-                       stop_loss_pct=None, trend_filter=None) -> list[Trade]:
+                       stop_loss_pct=None, trend_filter=None,
+                       opens=None) -> list[Trade]:
     """
     Strategy 2 (超卖反转):
         BUY:  jojo was below 28, then turns up (today > yesterday, yesterday < 28)
         SELL: jojo crosses above 51 OR drops below 28 again
 
+    Signal uses bar i close to compute jojo, entry/exit at bar i+1 open
+    to avoid look-ahead bias. Stop loss checked intraday at close.
+
     Optional optimizations:
         stop_loss_pct: fixed stop loss percentage (e.g. 20 means -20%)
         trend_filter: boolean array, only enter when True
+        opens: next-bar open prices for realistic entry/exit
     """
     trades = []
     in_position = False
     entry_date = None
     entry_price = None
     entry_idx = None
+    exec_prices = opens if opens is not None else closes
 
     for i in range(1, len(therm_vals)):
         t_today = therm_vals[i]
@@ -234,17 +257,19 @@ def backtest_strategy2(dates, closes, therm_vals, *,
             continue
 
         if not in_position:
-            # BUY: was below 28 and turning up
+            # BUY: was below 28 and turning up → enter at next bar open
             if t_yesterday < 28 and t_today > t_yesterday:
                 # Trend filter
                 if trend_filter is not None and not trend_filter[i]:
                     continue
+                if i + 1 >= len(therm_vals):
+                    break
                 in_position = True
-                entry_date = str(dates[i])
-                entry_price = closes[i]
-                entry_idx = i
+                entry_date = str(dates[i + 1])
+                entry_price = exec_prices[i + 1]
+                entry_idx = i + 1
         else:
-            # Stop loss check (before normal exit)
+            # Stop loss check at current close (intraday stop)
             if stop_loss_pct is not None:
                 pnl_now = (closes[i] / entry_price - 1) * 100
                 if pnl_now <= -stop_loss_pct:
@@ -262,30 +287,44 @@ def backtest_strategy2(dates, closes, therm_vals, *,
                     in_position = False
                     continue
 
-            # SELL: cross above 51
+            # SELL: cross above 51 → exit at next bar open
             if t_today > 51 and t_yesterday <= 51:
-                exit_price = closes[i]
+                if i + 1 < len(therm_vals):
+                    exit_price = exec_prices[i + 1]
+                    exit_date = str(dates[i + 1])
+                    exit_idx = i + 1
+                else:
+                    exit_price = closes[i]
+                    exit_date = str(dates[i])
+                    exit_idx = i
                 pnl = (exit_price / entry_price - 1) * 100
                 trades.append(Trade(
                     entry_date=entry_date,
                     entry_price=round(entry_price, 2),
-                    exit_date=str(dates[i]),
+                    exit_date=exit_date,
                     exit_price=round(exit_price, 2),
-                    holding_days=i - entry_idx,
+                    holding_days=exit_idx - entry_idx,
                     pnl_pct=round(pnl, 2),
                     exit_reason="上穿51",
                 ))
                 in_position = False
-            # SELL: drop below 28 again (止损)
+            # SELL: drop below 28 again → exit at next bar open
             elif t_today < 28 and t_yesterday >= 28:
-                exit_price = closes[i]
+                if i + 1 < len(therm_vals):
+                    exit_price = exec_prices[i + 1]
+                    exit_date = str(dates[i + 1])
+                    exit_idx = i + 1
+                else:
+                    exit_price = closes[i]
+                    exit_date = str(dates[i])
+                    exit_idx = i
                 pnl = (exit_price / entry_price - 1) * 100
                 trades.append(Trade(
                     entry_date=entry_date,
                     entry_price=round(entry_price, 2),
-                    exit_date=str(dates[i]),
+                    exit_date=exit_date,
                     exit_price=round(exit_price, 2),
-                    holding_days=i - entry_idx,
+                    holding_days=exit_idx - entry_idx,
                     pnl_pct=round(pnl, 2),
                     exit_reason="再次下穿28",
                 ))
@@ -313,14 +352,14 @@ def backtest_strategy2(dates, closes, therm_vals, *,
 # ---------------------------------------------------------------------------
 
 def _compute_atr_pct(df: pd.DataFrame, closes: np.ndarray, start: int) -> np.ndarray:
-    """Compute ATR%(14) = ATR(14) / Close * 100."""
+    """Compute ATR%(14) = ATR(14) / Close * 100 using Wilder's RMA."""
     high = df["high"].astype(float).values
     low = df["low"].astype(float).values
     close = df["close"].astype(float).values
     prev_close = np.roll(close, 1)
     prev_close[0] = close[0]
     tr = np.maximum(high - low, np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)))
-    atr = pd.Series(tr).rolling(14).mean().values
+    atr = _rma(pd.Series(tr), 14).values
     atr_pct = atr / close * 100
     return atr_pct[start:]
 
@@ -370,6 +409,7 @@ def run_backtest(symbol: str, df: pd.DataFrame, therm_vals: np.ndarray = None,
         therm_vals = compute_jojo(df).values
 
     closes = df["close"].astype(float).values
+    opens = df["open"].astype(float).values if "open" in df.columns else None
     dates = df.index if hasattr(df.index, 'strftime') else range(len(df))
 
     # Skip warmup period
@@ -382,10 +422,12 @@ def run_backtest(symbol: str, df: pd.DataFrame, therm_vals: np.ndarray = None,
     dates = dates[start:]
     closes = closes[start:]
     therm_vals = therm_vals[start:]
+    if opens is not None:
+        opens = opens[start:]
 
-    # Original strategies
-    trades1 = backtest_strategy1(dates, closes, therm_vals)
-    trades2 = backtest_strategy2(dates, closes, therm_vals)
+    # Original strategies (entry/exit at next bar open to avoid look-ahead bias)
+    trades1 = backtest_strategy1(dates, closes, therm_vals, opens=opens)
+    trades2 = backtest_strategy2(dates, closes, therm_vals, opens=opens)
 
     r1 = StrategyResult(symbol=symbol, strategy="超买动量 (76→68)", trades=trades1)
     r2 = StrategyResult(symbol=symbol, strategy="超卖反转 (28→51)", trades=trades2)
@@ -400,13 +442,16 @@ def run_backtest(symbol: str, df: pd.DataFrame, therm_vals: np.ndarray = None,
 
     # S1 optimized: stop loss + ATR% filter
     trades1_opt = backtest_strategy1(dates, closes, therm_vals,
-                                     stop_loss_pct=20, atr_pct=atr_pct, min_atr_pct=2.0)
+                                     stop_loss_pct=20, atr_pct=atr_pct, min_atr_pct=2.0,
+                                     opens=opens)
     # S2-A optimized: stop loss + SPX regime filter
     trades2a_opt = backtest_strategy2(dates, closes, therm_vals,
-                                      stop_loss_pct=20, trend_filter=regime_filter)
+                                      stop_loss_pct=20, trend_filter=regime_filter,
+                                      opens=opens)
     # S2-B optimized: stop loss + stock SMA(50) filter
     trades2b_opt = backtest_strategy2(dates, closes, therm_vals,
-                                      stop_loss_pct=20, trend_filter=sma_filter)
+                                      stop_loss_pct=20, trend_filter=sma_filter,
+                                      opens=opens)
 
     r1_opt = StrategyResult(symbol=symbol, strategy="超买动量优化 (止损20%+ATR≥2%)", trades=trades1_opt)
     r2a_opt = StrategyResult(symbol=symbol, strategy="超卖反转优化A (止损20%+SPX趋势)", trades=trades2a_opt)

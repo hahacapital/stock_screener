@@ -411,7 +411,7 @@ def main():
 
     # Step 4: Generate reports
     print(f"\n[4/5] Generating reports...")
-    os.makedirs("reports", exist_ok=True)
+    os.makedirs("reports/stocks", exist_ok=True)
 
     # Main summary report
     report = generate_report(all_results, regime, run_date)

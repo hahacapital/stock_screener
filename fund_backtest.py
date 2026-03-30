@@ -29,7 +29,7 @@ import pandas as pd
 import requests
 import yfinance as yf
 
-from indicators import compute_jojo
+from indicators import compute_jojo, _rma
 from screener import EXTRA_TICKERS
 
 # ---------------------------------------------------------------------------
@@ -312,7 +312,7 @@ def precompute_jojo(data: dict[str, pd.DataFrame]) -> dict[str, pd.Series]:
 
 
 def precompute_atr_pct(data: dict[str, pd.DataFrame]) -> dict[str, pd.Series]:
-    """Compute ATR%(14) for all tickers."""
+    """Compute ATR%(14) for all tickers using Wilder's RMA."""
     cache = {}
     for sym, df in data.items():
         high = df["high"].astype(float).values
@@ -321,7 +321,7 @@ def precompute_atr_pct(data: dict[str, pd.DataFrame]) -> dict[str, pd.Series]:
         prev_close = np.roll(close, 1)
         prev_close[0] = close[0]
         tr = np.maximum(high - low, np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)))
-        atr = pd.Series(tr, index=df.index).rolling(14).mean()
+        atr = _rma(pd.Series(tr, index=df.index), 14)
         cache[sym] = atr / df["close"].astype(float) * 100
     return cache
 
@@ -355,7 +355,20 @@ def fetch_shares_outstanding(tickers: list[str]) -> dict[str, float]:
 def compute_historical_pf(data: dict[str, pd.DataFrame],
                           jojo_cache: dict[str, pd.Series],
                           strategy: int) -> dict[str, float]:
-    """Compute historical profit factor for each ticker (full history, for legacy/comparison)."""
+    """Compute historical profit factor for each ticker (full history).
+
+    WARNING: This uses ALL historical data including future bars.
+    Using this for candidate ranking in a backtest introduces look-ahead bias.
+    Prefer build_rolling_pf_cache() with pf_window > 0 for backtesting.
+    """
+    import warnings
+    warnings.warn(
+        "compute_historical_pf uses full history including future data. "
+        "This causes look-ahead bias when used for ranking in backtests. "
+        "Use pf_window > 0 (rolling PF) instead.",
+        UserWarning,
+        stacklevel=2,
+    )
     pf_map = {}
     for sym, df in data.items():
         if sym not in jojo_cache:
@@ -558,17 +571,18 @@ def run_fund(data: dict[str, pd.DataFrame],
     trades: list[FundTrade] = []
     snapshots = []
 
-    def _get_price(sym, date):
-        """Get close price for sym at date, or last available price before date."""
+    def _get_price(sym, date, col="close"):
+        """Get price for sym at date, or last available price before date."""
         df = data.get(sym)
         if df is None:
             return None
+        c = col if col in df.columns else "close"
         if date in df.index:
-            return float(df.loc[date, "close"])
+            return float(df.loc[date, c])
         # Find last available price before date
         mask = df.index <= date
         if mask.any():
-            return float(df.loc[mask].iloc[-1]["close"])
+            return float(df.loc[mask].iloc[-1][c])
         return None
 
     def _close_position(sym, price, date, reason):
@@ -584,11 +598,116 @@ def run_fund(data: dict[str, pd.DataFrame],
             str(date)[:10], round(price, 2), pos.shares,
             round(pnl_pct, 2), round(pnl_dollar, 2), days, reason))
 
+    # Pending orders: signals detected on day N, executed at day N+1 open
+    pending_sells = []   # [(sym, reason)]
+    pending_buys = []    # [(sym, strat, atr_val)]
+
     for di in range(1, len(all_dates)):
         date = all_dates[di]
         prev_date = all_dates[di - 1]
 
-        # --- 1. Check stop losses ---
+        # --- 1. Execute pending sell orders from yesterday at today's OPEN ---
+        for sym, reason in pending_sells:
+            if sym not in positions:
+                continue
+            price = _get_price(sym, date, "open")
+            if price is None:
+                price = _get_price(sym, date, "close")
+            if price is not None:
+                _close_position(sym, price, date, reason)
+        pending_sells = []
+
+        # --- 2. Execute pending buy orders from yesterday at today's OPEN ---
+        # Determine effective max positions (regime filter) for allocation
+        eff_max = max_positions
+        if regime_filter and regime is not None and len(regime) > 0:
+            idx = regime.index.get_indexer([date], method="ffill")
+            if idx[0] >= 0 and regime.iloc[idx[0]] == "bear":
+                eff_max = max(1, max_positions // 2)
+
+        if pending_buys and len(positions) < eff_max:
+            # Rank pending candidates
+            candidates = pending_buys
+            if rank_method == "pf":
+                if rolling_pf is not None:
+                    cur_pf = get_rolling_pf(rolling_pf, prev_date)
+                else:
+                    cur_pf = static_pf
+                ranked = sorted(candidates, key=lambda x: cur_pf.get(x[0], 0), reverse=True)
+            elif rank_method in ("mktcap", "mktcap_asc", "mktcap_mid"):
+                _sh = shares_map or {}
+                def _approx_mktcap(sym):
+                    s = _sh.get(sym, 0)
+                    if s <= 0 or sym not in data or prev_date not in data[sym].index:
+                        return 0
+                    return float(data[sym].loc[prev_date, "close"]) * s
+                if rank_method == "mktcap_mid":
+                    by_cap = sorted(candidates, key=lambda x: _approx_mktcap(x[0]))
+                    mid = len(by_cap) // 2
+                    ranked = sorted(by_cap, key=lambda x: abs(by_cap.index(x) - mid))
+                else:
+                    desc = (rank_method == "mktcap")
+                    ranked = sorted(candidates, key=lambda x: _approx_mktcap(x[0]), reverse=desc)
+            elif rank_method in ("jojo", "jojo_asc"):
+                desc = (rank_method == "jojo")
+                ranked = sorted(candidates, key=lambda x: x[2], reverse=desc)  # x[2] is atr_val, use jojo from cache
+            else:
+                ranked = candidates
+            available_slots = eff_max - len(positions)
+
+            equity = cash + sum(
+                pos.shares * (_get_price(s, date) or pos.entry_price)
+                for s, pos in positions.items()
+            )
+
+            selected = ranked[:available_slots]
+
+            if vol_sizing and len(selected) > 0:
+                inv_atrs = []
+                for sym, strat, atr_val in selected:
+                    inv_atrs.append(1.0 / max(atr_val, 0.5))
+                total_inv = sum(inv_atrs)
+                avail_equity = equity * len(selected) / eff_max
+
+                for (sym, strat, atr_val), inv_a in zip(selected, inv_atrs):
+                    if cash < 1000:
+                        break
+                    if sym in positions:
+                        continue
+                    price = _get_price(sym, date, "open")
+                    if price is None:
+                        price = _get_price(sym, date, "close")
+                    if price is None:
+                        continue
+                    alloc = min(cash, avail_equity * inv_a / total_inv)
+                    shares = int(alloc / price)
+                    if shares <= 0:
+                        continue
+                    cost = shares * price
+                    cash -= cost
+                    positions[sym] = Position(sym, date, price, shares, strat)
+            else:
+                size_per_pos = equity / eff_max
+                for sym, strat, atr_val in selected:
+                    if cash < size_per_pos * 0.5:
+                        break
+                    if sym in positions:
+                        continue
+                    price = _get_price(sym, date, "open")
+                    if price is None:
+                        price = _get_price(sym, date, "close")
+                    if price is None:
+                        continue
+                    alloc = min(cash, size_per_pos)
+                    shares = int(alloc / price)
+                    if shares <= 0:
+                        continue
+                    cost = shares * price
+                    cash -= cost
+                    positions[sym] = Position(sym, date, price, shares, strat)
+        pending_buys = []
+
+        # --- 3. Check stop losses at today's close (intraday stop) ---
         to_close = []
         for sym, pos in positions.items():
             price = _get_price(sym, date)
@@ -601,9 +720,8 @@ def run_fund(data: dict[str, pd.DataFrame],
         for sym, price, reason in to_close:
             _close_position(sym, price, date, reason)
 
-        # --- 2. Check sell signals ---
-        to_sell = []
-        for sym, pos in positions.items():
+        # --- 4. Detect sell signals → queue for next-day execution ---
+        for sym, pos in list(positions.items()):
             if sym not in jojo_cache:
                 continue
             jojo = jojo_cache[sym]
@@ -624,32 +742,20 @@ def run_fund(data: dict[str, pd.DataFrame],
                 elif j_today < 28 and j_yest >= 28:
                     sell_reason = "再次下穿28"
 
-            if sell_reason and date in data[sym].index:
-                price = float(data[sym].loc[date, "close"])
-                to_sell.append((sym, price, sell_reason))
+            if sell_reason:
+                pending_sells.append((sym, sell_reason))
 
-        for sym, price, reason in to_sell:
-            _close_position(sym, price, date, reason)
-
-        # --- 3. Determine effective max positions (regime filter) ---
-        eff_max = max_positions
-        if regime_filter and regime is not None and len(regime) > 0:
-            idx = regime.index.get_indexer([date], method="ffill")
-            if idx[0] >= 0 and regime.iloc[idx[0]] == "bear":
-                eff_max = max(1, max_positions // 2)
-
-        # --- 4. Check buy signals ---
-        # If historical S&P 500 snapshots provided, filter to members at this date
+        # --- 5. Detect buy signals → queue for next-day execution ---
         eligible_syms = set(data.keys())
         if sp500_snapshots:
             sp500_members = _get_sp500_members_at(sp500_snapshots, date)
-            # Keep commodities (=F) even if not in S&P 500
             eligible_syms = sp500_members.intersection(eligible_syms) | {
                 s for s in data if s.endswith("=F")}
 
-        candidates = []
+        # Exclude positions and pending sells
+        pending_sell_syms = {s for s, _ in pending_sells}
         for sym in eligible_syms:
-            if sym in positions:
+            if sym in positions or sym in pending_sell_syms:
                 continue
             if sym not in jojo_cache:
                 continue
@@ -663,7 +769,7 @@ def run_fund(data: dict[str, pd.DataFrame],
 
             buy_signal = False
             strat = 0
-            if strategy in (1, 3):  # 3 = "all"
+            if strategy in (1, 3):
                 if j_today > 76 and j_yest <= 76:
                     if sym in atr_cache and date in atr_cache[sym].index:
                         atr_val = atr_cache[sym].loc[date]
@@ -681,87 +787,7 @@ def run_fund(data: dict[str, pd.DataFrame],
                     av = atr_cache[sym].loc[date]
                     if not np.isnan(av):
                         atr_val = float(av)
-                candidates.append((sym, float(j_today), strat, atr_val))
-
-        # --- 5. Rank candidates and allocate ---
-        if candidates and len(positions) < eff_max:
-            if rank_method == "pf":
-                # Rank by rolling / static profit factor
-                if rolling_pf is not None:
-                    cur_pf = get_rolling_pf(rolling_pf, date)
-                else:
-                    cur_pf = static_pf
-                ranked = sorted(candidates, key=lambda x: cur_pf.get(x[0], 0), reverse=True)
-            elif rank_method in ("mktcap", "mktcap_asc", "mktcap_mid"):
-                # Rank by approx market cap at current date (close × shares outstanding)
-                _sh = shares_map or {}
-                def _approx_mktcap(sym):
-                    s = _sh.get(sym, 0)
-                    if s <= 0 or sym not in data or date not in data[sym].index:
-                        return 0
-                    return float(data[sym].loc[date, "close"]) * s
-                if rank_method == "mktcap_mid":
-                    # Sort by cap, then reorder so median-ranked come first
-                    by_cap = sorted(candidates, key=lambda x: _approx_mktcap(x[0]))
-                    mid = len(by_cap) // 2
-                    ranked = sorted(by_cap, key=lambda x: abs(by_cap.index(x) - mid))
-                else:
-                    desc = (rank_method == "mktcap")
-                    ranked = sorted(candidates, key=lambda x: _approx_mktcap(x[0]), reverse=desc)
-            elif rank_method in ("jojo", "jojo_asc"):
-                # jojo: highest first (strongest momentum); jojo_asc: lowest first (just crossed)
-                desc = (rank_method == "jojo")
-                ranked = sorted(candidates, key=lambda x: x[1], reverse=desc)
-            else:
-                ranked = candidates
-            available_slots = eff_max - len(positions)
-
-            # Current equity for sizing
-            equity = cash + sum(
-                pos.shares * (_get_price(s, date) or pos.entry_price)
-                for s, pos in positions.items()
-            )
-
-            selected = ranked[:available_slots]
-
-            if vol_sizing and len(selected) > 0:
-                # ATR% inverse weighting: lower vol → bigger position
-                inv_atrs = []
-                for sym, j_val, strat, atr_val in selected:
-                    inv_atrs.append(1.0 / max(atr_val, 0.5))  # floor at 0.5% to avoid huge positions
-                total_inv = sum(inv_atrs)
-                # Available equity for new positions (proportional to slots)
-                avail_equity = equity * len(selected) / eff_max
-
-                for (sym, j_val, strat, atr_val), inv_a in zip(selected, inv_atrs):
-                    if cash < 1000:
-                        break
-                    if date not in data[sym].index:
-                        continue
-                    alloc = min(cash, avail_equity * inv_a / total_inv)
-                    price = float(data[sym].loc[date, "close"])
-                    shares = int(alloc / price)
-                    if shares <= 0:
-                        continue
-                    cost = shares * price
-                    cash -= cost
-                    positions[sym] = Position(sym, date, price, shares, strat)
-            else:
-                # Equal weight
-                size_per_pos = equity / eff_max
-                for sym, j_val, strat, atr_val in selected:
-                    if cash < size_per_pos * 0.5:
-                        break
-                    if date not in data[sym].index:
-                        continue
-                    alloc = min(cash, size_per_pos)
-                    price = float(data[sym].loc[date, "close"])
-                    shares = int(alloc / price)
-                    if shares <= 0:
-                        continue
-                    cost = shares * price
-                    cash -= cost
-                    positions[sym] = Position(sym, date, price, shares, strat)
+                pending_buys.append((sym, strat, atr_val))
 
         # --- 6. Daily snapshot ---
         mkt_value = 0
@@ -770,7 +796,6 @@ def run_fund(data: dict[str, pd.DataFrame],
             if p is not None:
                 mkt_value += pos.shares * p
             else:
-                # Fallback to entry price if no data at all
                 mkt_value += pos.shares * pos.entry_price
         equity = cash + mkt_value
         snapshots.append((date, equity, cash, len(positions)))
