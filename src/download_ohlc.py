@@ -26,7 +26,7 @@ import yfinance as yf
 import data_loader as dl
 from screener import EXTRA_TICKERS, get_exchange_tickers
 
-S3_DIR = "s3://staking-ledger-bpt/jojo_quant/ohlc/"
+S3_DIR = "s3://hahacapital-jp/jojo_quant/ohlc/"  # ap-northeast-1 (Tokyo); was us-east-1 staking-ledger-bpt
 OHLC_COLS = dl.OHLC_COLS
 DELISTED_THRESHOLD = 10  # consecutive empty updates → status='delisted'
 
