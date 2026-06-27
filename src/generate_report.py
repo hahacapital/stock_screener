@@ -35,7 +35,7 @@ START_DATE = "2009-01-01"
 SPX_SYMBOL = "^GSPC"
 SMA_LENGTH = 225
 REPORT_PATH = str(REPORTS_DIR / "backtest_report.md")
-S3_DIR = "s3://staking-ledger-bpt/jojo_quant/reports/"
+S3_DIR = "s3://hahacapital-jp/jojo_quant/reports/"  # ap-northeast-1 (Tokyo); was us-east-1 staking-ledger-bpt
 
 
 # ---------------------------------------------------------------------------
